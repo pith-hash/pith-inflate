@@ -43,6 +43,10 @@ docs/public/raw/
 docs/public/install.sh
 docs/public/install.ps1
 
+# Python SDK build scaffolding
+sdk/python/build/
+*.egg-info/
+
 # Python bytecode
 __pycache__/
 *.pyc

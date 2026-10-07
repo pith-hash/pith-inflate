@@ -17,15 +17,17 @@
 //! Every entry point takes a [`Limits`]. A decompression API without a size
 //! ceiling is a denial-of-service primitive: a few hundred bytes of input
 //! expand to gigabytes. The crate is `no_std` apart from the `alloc`
-//! [`Vec`] its API returns, and no allocation is ever sized
-//! from a length field read out of the stream without being clamped first.
+//! [`Vec`] its API returns, and no allocation is ever sized from a
+//! length field read out of the stream without being clamped first.
 //!
-//! DEFLATE packs bits least-significant bit first: the first byte's bit 0 is
-//! BFINAL and bits 1-2 are BTYPE. Huffman codes alone are packed
-//! most-significant bit of the code first (RFC 1951 section 3.1.1).
+//! The `std` feature (on by default) links `std` so the `cdylib` the
+//! language SDKs bind through carries a panic handler.
 
-#![no_std]
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "std"), no_std)]
+// `unsafe` is denied everywhere except `ffi`, the C ABI surface the
+// language SDKs bind through: raw pointers exist only at that boundary,
+// and every exported function is a documented `unsafe extern "C"` fn.
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 extern crate alloc;
@@ -33,6 +35,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use pith_digest::{Error, Result};
+
+pub mod ffi;
 
 /// Maximum code length in bits; RFC 1951 never exceeds this.
 const MAX_BITS: usize = 15;

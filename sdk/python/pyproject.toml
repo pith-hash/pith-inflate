@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pith-inflate"
+version = "0.1.0"
+description = "DEFLATE and zlib decompression SDK: RFC 1951/1950 streams with hard size limits via the pith-inflate Rust cdylib (ctypes, zero-dep)"
+license = "MIT"
+requires-python = ">=3.9"
+keywords = ["deflate", "zlib", "inflate", "decompression", "hashing"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: System :: Archiving :: Compression",
+]
+
+[project.urls]
+Repository = "https://github.com/pith-hash/pith-inflate"
+Homepage = "https://github.com/pith-hash/pith-inflate"
+
+[tool.setuptools]
+packages = ["pith_inflate"]
+
+[tool.setuptools.package-data]
+pith_inflate = ["*.dll", "*.dylib", "*.so"]
