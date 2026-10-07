@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "DEFLATE and zlib stream decoding (RFC 1951, RFC 1950)"
 readme = "README.md"
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 pith-digest = { git = "https://github.com/pith-hash/pith-digest.git", branch = "main" }

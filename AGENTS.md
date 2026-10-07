@@ -4,7 +4,7 @@
 
 - Repo: `pith-hash/pith-inflate`
 - Description: pith foundation: inflate (zero-dep Rust)
-- License: Apache-2.0
+- License: MIT
 
 ## Build & Test
 
