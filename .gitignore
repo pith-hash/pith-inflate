@@ -28,6 +28,7 @@ Thumbs.db
 .env.*
 
 # Build
+/target
 vendor/
 
 # Node (Astro Starlight docs)

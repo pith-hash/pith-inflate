@@ -2,8 +2,18 @@
 name = "pith-inflate"
 version = "0.1.0"
 edition = "2024"
-description = "pith foundation: inflate (zero-dep Rust)"
+rust-version = "1.85"
+description = "DEFLATE and zlib stream decoding (RFC 1951, RFC 1950)"
 readme = "README.md"
 license = "Apache-2.0"
 
 [dependencies]
+pith-digest = { git = "https://github.com/pith-hash/pith-digest.git", branch = "main" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[[bin]]
+name = "gen-reference"
+path = "tools/gen-reference/main.rs"
