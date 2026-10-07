@@ -3,7 +3,7 @@
 ## Quick reference
 
 - Repo: `pith-hash/pith-inflate`
-- Description: pith foundation: pith-inflate (zero-dep Rust)
+- Description: pith foundation: inflate (zero-dep Rust)
 - License: Apache-2.0
 
 ## Build & Test
