@@ -86,7 +86,10 @@ jobs:
         run: cargo test --workspace --locked
       - name: Reference vectors are current
         # The gen-reference binary recomputes every vector and compares it
-        # byte-for-byte against the committed reference.json.
+        # byte-for-byte against the committed reference.json. Suite repos
+        # carry tools/gen-reference; foundation repos run without it until
+        # the binary is ported in, so this gate stays skipped there.
+        if: hashFiles('tools/gen-reference/**') != ''
         run: cargo run --locked --bin gen-reference -- verify
       - name: Coverage gate (>= 95% lines)
         # Measured once per matrix: the gate is a workspace property, not an
