@@ -2,5 +2,8 @@
 name = "pith-inflate"
 version = "0.1.0"
 edition = "2024"
+description = "pith foundation: inflate (zero-dep Rust)"
+readme = "README.md"
+license = "Apache-2.0"
 
 [dependencies]
