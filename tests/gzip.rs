@@ -220,6 +220,13 @@ trait Hex {
 
 impl Hex for [u8] {
     fn hex(&self) -> String {
-        self.iter().map(|b| format!("{b:02x}")).collect()
+        // `write!` into one string: the older clippy pin in CI rejects
+        // the `map(format!).collect()` shape this replaces.
+        let mut out = String::with_capacity(self.len() * 2);
+        for byte in self {
+            use core::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
     }
 }
