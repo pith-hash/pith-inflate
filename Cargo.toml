@@ -25,7 +25,7 @@ std = []
 # implementation every other pith-* crate verifies with - instead of a
 # private copy. Still zero registry packages: the whitelist gate in
 # scripts/check-zero-deps.py admits pith-* names only.
-pith-digest = { git = "https://github.com/pith-hash/pith-digest.git", branch = "main" }
+pith-digest = { version = "0.1", git = "https://github.com/pith-hash/pith-digest.git", branch = "main" }
 
 # `unsafe_code` is denied at the crate root (`#![deny(unsafe_code)]` in
 # src/lib.rs), with the single `#![allow(unsafe_code)]` confined to
