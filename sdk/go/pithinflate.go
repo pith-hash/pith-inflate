@@ -20,13 +20,16 @@
 //     anchored at this package's source directory, so a source
 //     checkout runs against a local cargo build unconfigured.
 //
-// The FFI surface is three decompress operations, one checksum and one
-// free: InflateRaw, InflateZlib and InflateAuto run the crate's
-// conservative default limits (64 MiB of input, 64 MiB of output) and
-// return the decompressed bytes as a Go copy (the handed-out cdylib
-// buffer is released before returning); Adler32 checksums any buffer
-// without allocating. A stream the decoder refuses comes back as an
-// *FfiError with Status StatusRejected — never a panic.
+// The FFI surface is four decompress operations, one checksum and one
+// free: InflateRaw, InflateZlib, InflateAuto and InflateGzip run the
+// crate's conservative default limits (64 MiB of input, 64 MiB of
+// output) and return the decompressed bytes as a Go copy (the
+// handed-out cdylib buffer is released before returning); Adler32
+// checksums any buffer without allocating. StreamingInflater
+// implements the incremental-feed shape on top of the stateless
+// one-shot exports - see its doc for the canonicalization tradeoff. A
+// stream the decoder refuses comes back as an *FfiError with Status
+// StatusRejected - never a panic.
 package pithinflate
 
 import (
@@ -133,6 +136,16 @@ func InflateAuto(data []byte) ([]byte, error) {
 	return inflate("pith_inflate_inflate_auto", data)
 }
 
+// InflateGzip decompresses a gzip (RFC 1952) container: the ten-byte
+// header (FEXTRA/FNAME/FCOMMENT/FHCRC optional fields included), the
+// DEFLATE payload, and the CRC-32 + ISIZE trailer. A multi-member
+// stream (concatenated .gz files) decodes to the concatenation of
+// every member's payload. Buffer handling and error semantics are
+// those of InflateRaw.
+func InflateGzip(data []byte) ([]byte, error) {
+	return inflate("pith_inflate_inflate_gzip", data)
+}
+
 // inflate resolves the cdylib, runs one decompress symbol and copies
 // the handed-out buffer into a Go slice before releasing it.
 func inflate(symbol string, data []byte) ([]byte, error) {
@@ -180,4 +193,79 @@ func Adler32(data []byte) (uint32, error) {
 		return 0, &FfiError{Op: "pith_inflate_adler32", Status: status}
 	}
 	return sum, nil
+}
+
+// streamingSymbols maps a StreamingInflater framing to its one-shot
+// FFI symbol, the decode the canonicalization re-runs.
+var streamingSymbols = map[string]string{
+	"raw":  "pith_inflate_inflate_raw",
+	"zlib": "pith_inflate_inflate_zlib",
+	"gzip": "pith_inflate_inflate_gzip",
+}
+
+// StreamingInflater is an incremental-feed decode canonicalized
+// through the one-shot FFI.
+//
+// The binding holds no decoder state across the C ABI - the suite's
+// FFI is deliberately stateless - so it implements the feed/finish
+// shape by re-decoding the bytes buffered so far through the framing's
+// one-shot export on every call. That is O(n^2) across a stream in the
+// worst case, correct by construction, and byte-identical to the Rust
+// StreamingDecoder by the chunked-feed equivalence property the Rust
+// test suite pins. Throughput paths should call the one-shot
+// functions directly.
+//
+// A Feed reports whether the bytes fed so far already decode
+// completely - for a multi-member stream that is true at every member
+// boundary, so keep feeding and let Finish give the final verdict.
+// Output tracks the longest decoded prefix. An incomplete - or so far
+// invalid - stream reports false: the stateless FFI cannot tell "needs
+// more input" from "broken input". Finish gives the verdict, returning
+// the decode's error for a stream that never decoded.
+type StreamingInflater struct {
+	symbol string // the one-shot FFI symbol the canonicalization runs
+	buffer []byte // every byte fed so far
+	output []byte // the longest decoded prefix
+	done   bool   // whether the last Feed decoded its buffered bytes
+}
+
+// NewStreamingInflater returns a StreamingInflater for the framing
+// "raw", "zlib" or "gzip".
+func NewStreamingInflater(framing string) (*StreamingInflater, error) {
+	symbol, ok := streamingSymbols[framing]
+	if !ok {
+		return nil, fmt.Errorf("pithinflate: framing must be one of gzip, raw, zlib, got %q", framing)
+	}
+	return &StreamingInflater{symbol: symbol}, nil
+}
+
+// Feed feeds the next chunk. It reports true when the bytes fed so far
+// decode completely, false while more input (or the verdict) is
+// needed.
+func (s *StreamingInflater) Feed(chunk []byte) bool {
+	s.buffer = append(s.buffer, chunk...)
+	out, err := inflate(s.symbol, s.buffer)
+	if err != nil {
+		return false
+	}
+	s.output, s.done = out, true
+	return true
+}
+
+// Output returns the decoded bytes; empty until the stream decoded.
+func (s *StreamingInflater) Output() []byte {
+	return s.output
+}
+
+// Finish ends the stream: the decoded bytes, or the decode's refusal
+// (malformed, truncated or over-limit input).
+func (s *StreamingInflater) Finish() ([]byte, error) {
+	if !s.done {
+		out, err := inflate(s.symbol, s.buffer)
+		if err != nil {
+			return nil, err
+		}
+		s.output, s.done = out, true
+	}
+	return s.output, nil
 }

@@ -7,6 +7,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +77,45 @@ func looksLikeZlib(b []byte) bool {
 		b[0]&0x0f == 8 &&
 		b[0]>>4 <= 7 &&
 		(uint16(b[0])<<8|uint16(b[1]))%31 == 0
+}
+
+// gzipReference parses the committed reference.json's gzip arrays:
+// good container entries (input -> plain, pinned by CRC-32) and
+// malformed ones.
+func gzipReference(t *testing.T) (vectors []struct {
+	Name  string `json:"name"`
+	File  string `json:"file"`
+	Input string `json:"input"`
+	Plain string `json:"plain"`
+	CRC32 string `json:"crc32"`
+}, bad []struct {
+	Name  string `json:"name"`
+	Input string `json:"input"`
+	Kind  string `json:"kind"`
+}) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "reference.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		GzipVectors []struct {
+			Name  string `json:"name"`
+			File  string `json:"file"`
+			Input string `json:"input"`
+			Plain string `json:"plain"`
+			CRC32 string `json:"crc32"`
+		} `json:"gzip_vectors"`
+		GzipBadVectors []struct {
+			Name  string `json:"name"`
+			Input string `json:"input"`
+			Kind  string `json:"kind"`
+		} `json:"gzip_bad_vectors"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	return parsed.GzipVectors, parsed.GzipBadVectors
 }
 
 // TestReferenceVectorsHexExact replays every committed reference.json
@@ -254,5 +296,165 @@ func TestRefusals(t *testing.T) {
 	}
 	if _, err := Adler32(nil); err != nil {
 		t.Fatalf("adler32(empty): %v", err)
+	}
+}
+
+// --- tier-1 expansion: gzip containers and streaming (schema 2 arrays) ---
+
+// TestGzipVectorsHexExact replays every committed gzip container
+// through the cdylib and compares byte-exact against the recorded
+// plain hex; the CRC-32 the Rust decoder validated the trailer with is
+// cross-checked against Go's own hash/crc32 so a wrongly generated
+// reference fails loudly on both sides.
+func TestGzipVectorsHexExact(t *testing.T) {
+	vectors, _ := gzipReference(t)
+	for _, v := range vectors {
+		data, err := hex.DecodeString(v.Input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := InflateGzip(data)
+		if err != nil {
+			t.Fatalf("%s: %v", v.Name, err)
+		}
+		if want, err := hex.DecodeString(v.Plain); err != nil || !bytes.Equal(out, want) {
+			t.Fatalf("%s: plain mismatch", v.Name)
+		}
+		if got := fmt.Sprintf("%08x", crc32.ChecksumIEEE(out)); got != v.CRC32 {
+			t.Fatalf("%s: crc32 %s != %s", v.Name, got, v.CRC32)
+		}
+	}
+}
+
+// TestGzipBadVectorsRefused replays every malformed gzip container and
+// requires StatusRejected - never a panic, never a wrong decode.
+func TestGzipBadVectorsRefused(t *testing.T) {
+	_, bad := gzipReference(t)
+	for _, v := range bad {
+		data, err := hex.DecodeString(v.Input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := InflateGzip(data); err == nil {
+			t.Fatalf("%s: unexpectedly decoded", v.Name)
+		} else {
+			var ffi *FfiError
+			if !errors.As(err, &ffi) || ffi.Status != StatusRejected {
+				t.Fatalf("%s: expected StatusRejected, got %v", v.Name, err)
+			}
+		}
+	}
+}
+
+// TestGzipStreamingFeedMatchesOneShot is the chunked-feed equivalence
+// property through the SDK helper: any chunking decodes to the
+// one-shot output byte-exact.
+func TestGzipStreamingFeedMatchesOneShot(t *testing.T) {
+	vectors, _ := gzipReference(t)
+	for _, v := range vectors {
+		data, err := hex.DecodeString(v.Input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected, err := InflateGzip(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, size := range []int{1, 7, 64} {
+			streamer, err := NewStreamingInflater("gzip")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for start := 0; start < len(data); start += size {
+				end := start + size
+				if end > len(data) {
+					end = len(data)
+				}
+				streamer.Feed(data[start:end])
+				if got := streamer.Output(); !bytes.Equal(expected[:len(got)], got) {
+					t.Fatalf("%s (chunk %d): output is not a prefix", v.Name, size)
+				}
+			}
+			got, err := streamer.Finish()
+			if err != nil || !bytes.Equal(got, expected) {
+				t.Fatalf("%s (chunk %d): finish mismatch (%v)", v.Name, size, err)
+			}
+		}
+	}
+}
+
+// TestStreamingRawAndZlibMatchOneShot feeds one byte at a time through
+// the raw and zlib framings and requires the one-shot output.
+func TestStreamingRawAndZlibMatchOneShot(t *testing.T) {
+	vectors, _ := reference(t)
+	for _, tc := range []struct{ name, framing string }{
+		{"one_byte", "raw"},
+		{"one_byte/zlib", "zlib"},
+	} {
+		var vector struct {
+			Name       string `json:"name"`
+			Compressed string `json:"compressed"`
+			Plain      string `json:"plain"`
+		}
+		for _, v := range vectors {
+			if v.Name == tc.name {
+				vector.Name, vector.Compressed, vector.Plain = v.Name, v.Compressed, v.Plain
+			}
+		}
+		data, err := hex.DecodeString(vector.Compressed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		streamer, err := NewStreamingInflater(tc.framing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range data {
+			streamer.Feed([]byte{b})
+		}
+		got, err := streamer.Finish()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		want, _ := hex.DecodeString(vector.Plain)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: mismatch", tc.name)
+		}
+	}
+}
+
+// TestStreamingFinishSurfacesRejection requires a truncated gzip
+// member to end in StatusRejected at Finish, never a crash.
+func TestStreamingFinishSurfacesRejection(t *testing.T) {
+	vectors, _ := gzipReference(t)
+	data, err := hex.DecodeString(vectors[0].Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamer, err := NewStreamingInflater("gzip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamer.Feed(data[:len(data)/4]) {
+		t.Fatal("a quarter of a stream must not decode")
+	}
+	if len(streamer.Output()) != 0 {
+		t.Fatal("no output before a decode")
+	}
+	if _, err := streamer.Finish(); err == nil {
+		t.Fatal("finish must refuse the truncated stream")
+	} else {
+		var ffi *FfiError
+		if !errors.As(err, &ffi) || ffi.Status != StatusRejected {
+			t.Fatalf("expected StatusRejected, got %v", err)
+		}
+	}
+}
+
+// TestStreamingRejectsUnknownFraming pins the constructor's framing
+// validation.
+func TestStreamingRejectsUnknownFraming(t *testing.T) {
+	if _, err := NewStreamingInflater("bzip2"); err == nil {
+		t.Fatal("expected an error")
 	}
 }

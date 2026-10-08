@@ -122,3 +122,76 @@ test("full output matches a rust-pinned vector", () => {
   );
   assert.equal(adler32(out).toString(16).padStart(8, "0"), "f724c355");
 });
+
+// --- tier-1 expansion: gzip containers and streaming (schema 2 arrays) ---
+
+const { inflateGzip, StreamingInflate } = require("../index.js");
+const zlib = require("node:zlib");
+
+for (const vector of REFERENCE.gzip_vectors) {
+  test(`gzip vector ${vector.name} is reproduced hex-exact`, () => {
+    const data = Buffer.from(vector.input, "hex");
+    const out = inflateGzip(data);
+    assert.deepEqual(out, Buffer.from(vector.plain, "hex"), vector.name);
+    // The CRC-32 the Rust decoder validated the trailer with, pinned in
+    // reference.json; cross-checked against Node's own zlib here so a
+    // wrongly generated reference fails loudly on both sides.
+    assert.equal(zlib.crc32(out).toString(16).padStart(8, "0"), vector.crc32, vector.name);
+  });
+}
+
+for (const vector of REFERENCE.gzip_bad_vectors) {
+  test(`gzip bad vector ${vector.name} is refused, not crashing`, () => {
+    assert.throws(() => inflateGzip(Buffer.from(vector.input, "hex")), (err) => {
+      assert.ok(err instanceof FfiError);
+      assert.equal(err.status, -2, vector.name);
+      return true;
+    });
+  });
+}
+
+for (const size of [1, 7, 64]) {
+  for (const vector of REFERENCE.gzip_vectors) {
+    test(`gzip ${vector.name} streams identically at chunk size ${size}`, () => {
+      const data = Buffer.from(vector.input, "hex");
+      const expected = inflateGzip(data);
+      const streamer = new StreamingInflate("gzip");
+      for (let start = 0; start < data.length; start += size) {
+        streamer.feed(data.subarray(start, start + size));
+        assert.ok(expected.subarray(0, streamer.output().length).equals(streamer.output()), vector.name);
+      }
+      assert.deepEqual(streamer.finish(), expected, vector.name);
+    });
+  }
+}
+
+test("streaming raw and zlib framings match the one-shot decode", () => {
+  for (const [name, framing] of [["one_byte", "raw"], ["one_byte/zlib", "zlib"]]) {
+    const vector = REFERENCE.vectors.find((v) => v.name === name);
+    const data = Buffer.from(vector.compressed, "hex");
+    const streamer = new StreamingInflate(framing);
+    for (let index = 0; index < data.length; index++) {
+      streamer.feed(data.subarray(index, index + 1));
+    }
+    assert.deepEqual(streamer.finish(), Buffer.from(vector.plain, "hex"), name);
+  }
+});
+
+test("streaming finish surfaces the rejection", () => {
+  // A truncated gzip member never decodes: feeds stay false and
+  // finish throws the FFI's refusal, never a crash.
+  const vector = REFERENCE.gzip_vectors[0];
+  const data = Buffer.from(vector.input, "hex").subarray(0, vector.input.length / 4);
+  const streamer = new StreamingInflate("gzip");
+  assert.equal(streamer.feed(data), false);
+  assert.equal(streamer.output().length, 0);
+  assert.throws(() => streamer.finish(), (err) => {
+    assert.ok(err instanceof FfiError);
+    assert.equal(err.status, -2);
+    return true;
+  });
+});
+
+test("streaming rejects an unknown framing", () => {
+  assert.throws(() => new StreamingInflate("bzip2"), TypeError);
+});

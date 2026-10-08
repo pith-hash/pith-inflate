@@ -28,6 +28,8 @@ __all__ = [
     "inflate_raw",
     "inflate_zlib",
     "inflate_auto",
+    "inflate_gzip",
+    "StreamingInflater",
     "adler32",
 ]
 
@@ -99,7 +101,12 @@ def _load() -> ctypes.CDLL:
     global _lib
     if _lib is None:
         lib = ctypes.CDLL(str(find_cdylib()))
-        for op in ("pith_inflate_inflate_raw", "pith_inflate_inflate_zlib", "pith_inflate_inflate_auto"):
+        for op in (
+            "pith_inflate_inflate_raw",
+            "pith_inflate_inflate_zlib",
+            "pith_inflate_inflate_auto",
+            "pith_inflate_inflate_gzip",
+        ):
             fn = getattr(lib, op)
             fn.argtypes = [
                 ctypes.c_void_p,  # data
@@ -163,6 +170,78 @@ def inflate_auto(data: bytes) -> bytes:
     mis-decoded.
     """
     return _decompress("pith_inflate_inflate_auto", data)
+
+
+def inflate_gzip(data: bytes) -> bytes:
+    """Decompresses a gzip (RFC 1952) container: the ten-byte header
+    (``FEXTRA``/``FNAME``/``FCOMMENT``/``FHCRC`` optional fields
+    included), the DEFLATE payload, and the CRC-32 + ISIZE trailer.
+
+    A multi-member stream (concatenated ``.gz`` files) decodes to the
+    concatenation of every member's payload.
+
+    Raises :class:`FfiError` with ``status == STATUS_REJECTED`` for any
+    malformed input, including a trailer whose CRC-32 or ISIZE does not
+    match the produced output.
+    """
+    return _decompress("pith_inflate_inflate_gzip", data)
+
+
+class StreamingInflater:
+    """Incremental-feed decode canonicalized through the one-shot FFI.
+
+    The binding holds no decoder state across the C ABI - the suite's
+    FFI is deliberately stateless - so this helper implements the
+    feed/finish shape by re-decoding the bytes buffered so far through
+    the framing's one-shot export on every call. That is O(n^2) across
+    a stream in the worst case, correct by construction, and
+    byte-identical to the Rust ``StreamingDecoder`` by the chunked-feed
+    equivalence property the Rust test suite pins. Throughput paths
+    should call the one-shot functions directly.
+
+    A feed reports whether the bytes fed so far already decode
+    completely - for a multi-member stream that is true at every
+    member boundary, so keep feeding and let :meth:`finish` give the
+    final verdict. :meth:`output` tracks the longest decoded prefix.
+    An incomplete - or so far invalid - stream reports ``False``: the
+    stateless FFI cannot tell "needs more input" from "broken input".
+    :meth:`finish` gives the verdict, raising :class:`FfiError` for a
+    stream that never decoded.
+    """
+
+    def __init__(self, framing: str = "gzip") -> None:
+        ops = {"raw": inflate_raw, "zlib": inflate_zlib, "gzip": inflate_gzip}
+        if framing not in ops:
+            valid = ", ".join(sorted(ops))
+            raise ValueError(f"framing must be one of {valid}, got {framing!r}")
+        #: The one-shot decode this canonicalization runs.
+        self._op = ops[framing]
+        #: Every byte fed so far.
+        self._buffer = bytearray()
+        #: The longest decoded prefix, else ``None``.
+        self._output: bytes | None = None
+
+    def feed(self, data: bytes) -> bool:
+        """Feeds the next chunk; ``True`` when the bytes fed so far
+        decode completely, ``False`` while more (or a verdict) is
+        needed."""
+        self._buffer += data
+        try:
+            self._output = self._op(bytes(self._buffer))
+        except FfiError:
+            return False
+        return True
+
+    def output(self) -> bytes:
+        """The decoded bytes; empty until the stream decoded."""
+        return self._output if self._output is not None else b""
+
+    def finish(self) -> bytes:
+        """Ends the stream: the decoded bytes, or the decode's refusal
+        as :class:`FfiError` (malformed, truncated or over-limit)."""
+        if self._output is None:
+            self._output = self._op(bytes(self._buffer))
+        return self._output
 
 
 def adler32(data: bytes) -> int:

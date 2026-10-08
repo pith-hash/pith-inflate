@@ -19,6 +19,7 @@ compression level - so the suite can assert that all three block types are
 covered instead of hoping they are.
 """
 
+import gzip
 import zlib
 import random
 import struct
@@ -185,6 +186,125 @@ _hand = _w.bytes()
 add_bad("distance_before_start", _hand, "BadValue",
         "a back-reference at distance 2 when only one byte has been produced")
 
+# --- gzip containers (RFC 1952) -------------------------------------------
+# Valid members are the committed fixture files in tests/fixtures/gzip/
+# (see their PROVENANCE.md); this script reads the bytes and inlines them
+# as hex, so the corpus stays self-contained while the fixture files stay
+# canonical. Malformed members are one-defect mutations of a crafted
+# good member, built here so each names exactly the check it defeats.
+
+GZIP_FIXTURES = HERE / "tests" / "fixtures" / "gzip"
+
+GZ_FTEXT, GZ_FHCRC, GZ_FEXTRA, GZ_FNAME, GZ_FCOMMENT = 0x01, 0x02, 0x04, 0x08, 0x10
+
+GZIP = []
+
+
+def add_gzip(name: str, fixture: str, why: str) -> None:
+    GZIP.append((name, fixture, why))
+
+
+for _stem, _why in [
+    ("hello", "a plain gzip(1) member: fixed header, no optional fields"),
+    ("empty", "the empty payload through a full gzip member (empty DEFLATE, zero CRC-32, zero ISIZE)"),
+    ("two-members", "two members concatenated: output is the concatenation, each member validated alone"),
+    ("binary", "incompressible member: stored blocks inside the gzip container"),
+    ("fextra", "FEXTRA: the XLEN-prefixed extra field is skipped byte-exactly"),
+    ("fname", "FNAME: the NUL-terminated original name is skipped"),
+    ("fcomment", "FCOMMENT: the NUL-terminated comment is skipped"),
+    ("fhcrc", "FHCRC: the header CRC16 is validated through pith-digest's crc32"),
+    ("all-flags", "FTEXT|FEXTRA|FNAME|FCOMMENT|FHCRC at once: every optional field in one header"),
+]:
+    add_gzip(f"gzip/{_stem}", _stem + ".gz", _why)
+
+GZIP_BAD = []
+
+
+def add_gzip_bad(name: str, data: bytes, kind: str, why: str) -> None:
+    GZIP_BAD.append((name, data, kind, why))
+
+
+def _gzip_member(payload: bytes, flg: int = 0, extra: bytes = b"", name: bytes = b"",
+                 comment: bytes = b"", fhcrc_value: int | None = None) -> bytes:
+    """The crafted-member recipe of tests/fixtures/gzip/make_fixtures.py.
+
+    MTIME 0, XFL 2, OS 3, raw DEFLATE body. `fhcrc_value` overrides the
+    header CRC16 for the corrupt-header mutation only.
+    """
+    head = bytearray(b"\x1f\x8b\x08")
+    head.append(flg)
+    head += (0).to_bytes(4, "little")
+    head.append(2)
+    head.append(3)
+    if flg & GZ_FEXTRA:
+        head += len(extra).to_bytes(2, "little")
+        head += extra
+    if flg & GZ_FNAME:
+        head += name + b"\x00"
+    if flg & GZ_FCOMMENT:
+        head += comment + b"\x00"
+    if flg & GZ_FHCRC:
+        crc16 = (zlib.crc32(bytes(head)) & 0xFFFF) if fhcrc_value is None else fhcrc_value
+        head += crc16.to_bytes(2, "little")
+    body = zlib.compressobj(9, zlib.DEFLATED, -15)
+    body_c = body.compress(payload) + body.flush()
+    trailer = (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "little")
+    trailer += (len(payload) & 0xFFFFFFFF).to_bytes(4, "little")
+    return bytes(head) + body_c + trailer
+
+
+_gz_good = _gzip_member(b"the gzip bad-vector payload")
+
+_flip = bytearray(_gz_good)
+_flip[1] = 0x8C  # ID2, part of the 1f 8b magic
+add_gzip_bad("gzip_bad_magic", bytes(_flip), "InvalidMagic",
+             "ID2 is not 0x8b, so this is not a gzip stream")
+
+_flip = bytearray(_gz_good)
+_flip[2] = 0x09  # CM: compression method 9
+add_gzip_bad("gzip_bad_method", bytes(_flip), "InvalidMagic",
+             "compression method is 9, not 8")
+
+_flip = bytearray(_gz_good)
+_flip[3] |= 0x20  # FLG bit 5 is reserved and must be zero
+add_gzip_bad("gzip_reserved_flags", bytes(_flip), "InvalidMagic",
+             "a reserved FLG bit is set")
+
+_crc16 = bytearray(
+    _gzip_member(b"FHCRC payload", flg=GZ_FHCRC, fhcrc_value=0x0000)
+)
+assert _crc16[10:12] == b"\x00\x00", "the FHCRC override did not land where expected"
+add_gzip_bad("gzip_bad_fhcrc", bytes(_crc16), "BadValue",
+             "the FHCRC check does not match CRC-32 of the header bytes")
+
+add_gzip_bad("gzip_truncated_header", _gz_good[:5], "Truncated",
+             "the stream ends inside the ten-byte fixed header")
+
+_fname = bytearray(_gzip_member(b"FNAME payload", flg=GZ_FNAME, name=b"long-name.txt"))
+add_gzip_bad("gzip_truncated_fname", bytes(_fname[:10 + 8]), "Truncated",
+             "the stream ends inside the NUL-terminated FNAME")
+
+_extra = bytearray(_gzip_member(
+    b"FEXTRA payload", flg=GZ_FEXTRA, extra=b"\x70\x68\x04\x00\x01\x02\x03\x04"
+))
+add_gzip_bad("gzip_truncated_fextra", bytes(_extra[:12 + 2]), "Truncated",
+             "the stream ends inside the XLEN extra-field bytes")
+
+_crcflip = bytearray(_gz_good)
+_crcflip[-5] ^= 0xFF  # CRC-32 trailer, one byte
+add_gzip_bad("gzip_bad_crc32", bytes(_crcflip), "BadValue",
+             "the CRC-32 trailer does not match the output")
+
+_isize = bytearray(_gz_good)
+_isize[-1] ^= 0x01  # ISIZE trailer, one bit
+add_gzip_bad("gzip_bad_isize", bytes(_isize), "BadValue",
+             "the ISIZE trailer does not match the output length")
+
+add_gzip_bad("gzip_truncated_trailer", _gz_good[:-2], "Truncated",
+             "the stream ends inside the CRC-32/ISIZE trailer")
+
+add_gzip_bad("gzip_empty_input", b"", "Truncated", "no bytes at all")
+
 # --- emit -----------------------------------------------------------------
 
 def hexlit(data: bytes) -> str:
@@ -289,6 +409,64 @@ for name, data, kind, why in BAD:
     print(f"  BAD {name:24s} {len(data):4d}B -> {kind}")
 lines.append("];")
 lines.append("")
+lines.append("/// A gzip (RFC 1952) container vector: `input` is the full member")
+lines.append("/// stream - exactly the bytes of the committed fixture file named")
+lines.append("/// by `file` - and must decompress through [`crate::inflate_gzip`]")
+lines.append("/// to `plain`.")
+lines.append("pub struct GzipVector {")
+lines.append("    /// The vector's name, which is also the test's name.")
+lines.append("    pub name: &'static str,")
+lines.append("    /// The committed fixture file these bytes are, relative to")
+lines.append("    /// `tests/fixtures/gzip/` (see its PROVENANCE.md).")
+lines.append("    pub file: &'static str,")
+lines.append("    /// What this vector is here to exercise.")
+lines.append("    pub why: &'static str,")
+lines.append("    /// The complete gzip stream, hex encoded.")
+lines.append("    pub input: &'static str,")
+lines.append("    /// The expected output, hex encoded.")
+lines.append("    pub plain: &'static str,")
+lines.append("}")
+lines.append("")
+lines.append("/// A gzip container with exactly one defect, and the error it must")
+lines.append("/// produce.")
+lines.append("pub struct GzipBadVector {")
+lines.append("    /// The vector's name, which is also the test's name.")
+lines.append("    pub name: &'static str,")
+lines.append("    /// What is wrong with this stream.")
+lines.append("    pub why: &'static str,")
+lines.append("    /// The malformed bytes, hex encoded.")
+lines.append("    pub input: &'static str,")
+lines.append("    /// The `Error` variant the decoder must return, by name.")
+lines.append("    pub kind: &'static str,")
+lines.append("}")
+lines.append("")
+lines.append("/// Every valid gzip container, byte-identical to its fixture file.")
+lines.append("pub const GZIP_VECTORS: &[GzipVector] = &[")
+for name, fixture, why in GZIP:
+    data = (GZIP_FIXTURES / fixture).read_bytes()
+    plain = gzip.decompress(data)  # multi-member aware, unlike zlib.decompress
+    lines.append("    GzipVector {")
+    lines.append(f"        name: {rust_str(name)},")
+    lines.append(f"        file: {rust_str(fixture)},")
+    lines.append(f"        why: {rust_str(why)},")
+    lines.append(f"        input: {hexlit(data)},")
+    lines.append(f"        plain: {hexlit(plain)},")
+    lines.append("    },")
+    print(f"  GZIP {name:20s} {len(data):6d}B -> {len(plain):6d}B ({fixture})")
+lines.append("];")
+lines.append("")
+lines.append("/// Every malformed gzip container.")
+lines.append("pub const GZIP_BAD_VECTORS: &[GzipBadVector] = &[")
+for name, data, kind, why in GZIP_BAD:
+    lines.append("    GzipBadVector {")
+    lines.append(f"        name: {rust_str(name)},")
+    lines.append(f"        why: {rust_str(why)},")
+    lines.append(f"        input: {hexlit(data)},")
+    lines.append(f"        kind: {rust_str(kind)},")
+    lines.append("    },")
+    print(f"  BAD {name:24s} {len(data):4d}B -> {kind}")
+lines.append("];")
+lines.append("")
 
 seen_names = {BLOCK_NAMES[b] for b in seen_blocks}
 missing = set(BLOCK_NAMES.values()) - seen_names
@@ -299,4 +477,5 @@ OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 print(f"\nblock types covered: {sorted(seen_names)}")
 print(f"valid vectors: {len(PLAINS) * 2}   malformed: {len(BAD)}")
+print(f"gzip vectors: {len(GZIP)}   gzip malformed: {len(GZIP_BAD)}")
 print(f"wrote {OUT} ({OUT.stat().st_size} bytes)")

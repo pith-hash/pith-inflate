@@ -41,7 +41,7 @@
 
 #![allow(unsafe_code)]
 
-use crate::{Limits, adler32, inflate_auto, inflate_raw, inflate_zlib};
+use crate::{Limits, adler32, inflate_auto, inflate_gzip, inflate_raw, inflate_zlib};
 
 /// Status: success.
 pub const PITH_OK: i32 = 0;
@@ -62,6 +62,8 @@ enum Op {
     Zlib,
     /// Sniff the framing (`inflate_auto`).
     Auto,
+    /// RFC 1952 gzip framing (`inflate_gzip`, multi-member aware).
+    Gzip,
 }
 
 /// Decompresses a raw RFC 1951 DEFLATE stream.
@@ -112,6 +114,21 @@ enum Op {
 /// Same contract as [`pith_inflate_inflate_raw`].
 #[rustfmt::skip]
 #[unsafe(no_mangle)] pub unsafe extern "C" fn pith_inflate_inflate_auto(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Auto, data, len, out, out_len) }
+
+/// Decompresses a gzip (RFC 1952) stream: header, optional FEXTRA /
+/// FNAME / FCOMMENT / FHCRC fields, DEFLATE payload, CRC-32 + ISIZE
+/// trailer - every member of a multi-member stream, outputs
+/// concatenated.
+///
+/// Buffer ownership, status codes and pointer rules are exactly those
+/// of [`pith_inflate_inflate_raw`]; see [`crate::inflate_gzip`] for the
+/// container rules (checksums route through `pith-digest`).
+///
+/// # Safety
+///
+/// Same contract as [`pith_inflate_inflate_raw`].
+#[rustfmt::skip]
+#[unsafe(no_mangle)] pub unsafe extern "C" fn pith_inflate_inflate_gzip(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Gzip, data, len, out, out_len) }
 
 /// Computes the Adler-32 checksum (RFC 1950 section 9) of `len` bytes
 /// at `data` into the caller-provided `out` slot.
@@ -221,6 +238,7 @@ fn inflate_framed(op: Op, bytes: &[u8]) -> Result<alloc::vec::Vec<u8>, i32> {
         Op::Raw => inflate_raw(bytes, &limits),
         Op::Zlib => inflate_zlib(bytes, &limits),
         Op::Auto => inflate_auto(bytes, &limits),
+        Op::Gzip => inflate_gzip(bytes, &limits),
     };
     result.map_err(|_| PITH_E_REJECTED)
 }
@@ -238,10 +256,10 @@ mod tests {
     use super::{
         Op, PITH_E_INVALID, PITH_E_REJECTED, PITH_OK, inflate_ffi, inflate_framed,
         pith_inflate_adler32, pith_inflate_free, pith_inflate_inflate_auto,
-        pith_inflate_inflate_raw, pith_inflate_inflate_zlib,
+        pith_inflate_inflate_gzip, pith_inflate_inflate_raw, pith_inflate_inflate_zlib,
     };
 
-    use super::vectors::{BAD_VECTORS, VECTORS};
+    use super::vectors::{BAD_VECTORS, GZIP_BAD_VECTORS, GZIP_VECTORS, VECTORS};
 
     /// Decodes the lowercase-hex encoding the corpus uses for every
     /// byte field.
@@ -316,6 +334,38 @@ mod tests {
             let op = if zlib_routed { Op::Zlib } else { Op::Raw };
             assert_eq!(
                 inflate_framed(op, &input),
+                Err(PITH_E_REJECTED),
+                "bad vector {} must be refused",
+                v.name
+            );
+        }
+    }
+
+    /// Every gzip container in the corpus reproduces hex-exact through
+    /// the gzip op, and its Adler-32 matches the digest the same output
+    /// is pinned by in `reference.json`'s corpus order.
+    #[test]
+    fn safe_core_reproduces_every_gzip_vector() {
+        for v in GZIP_VECTORS {
+            let input = unhex(v.input);
+            let plain = inflate_framed(Op::Gzip, &input)
+                .unwrap_or_else(|s| panic!("{} refused: {s}", v.name));
+            assert_eq!(hex(&plain), v.plain, "vector {}", v.name);
+            let mut sum = 0u32;
+            let status = unsafe { pith_inflate_adler32(plain.as_ptr(), plain.len(), &mut sum) };
+            assert_eq!(status, PITH_OK, "vector {}", v.name);
+            assert_eq!(sum, crate::adler32(&plain), "vector {}", v.name);
+        }
+    }
+
+    /// Every malformed gzip container is refused with
+    /// [`PITH_E_REJECTED`] through the gzip op - never a crash.
+    #[test]
+    fn safe_core_refuses_every_gzip_bad_vector() {
+        for v in GZIP_BAD_VECTORS {
+            let input = unhex(v.input);
+            assert_eq!(
+                inflate_framed(Op::Gzip, &input),
                 Err(PITH_E_REJECTED),
                 "bad vector {} must be refused",
                 v.name
@@ -441,6 +491,7 @@ mod tests {
             pith_inflate_inflate_raw,
             pith_inflate_inflate_zlib,
             pith_inflate_inflate_auto,
+            pith_inflate_inflate_gzip,
         ] {
             let status = unsafe {
                 op_ffi(
@@ -475,7 +526,7 @@ mod tests {
         // three routings; so is structural garbage.
         let inputs: [&[u8]; 2] = [&compressed, &garbage];
         for input in inputs {
-            for op in [Op::Raw, Op::Zlib, Op::Auto] {
+            for op in [Op::Raw, Op::Zlib, Op::Auto, Op::Gzip] {
                 assert_eq!(
                     inflate_ffi(op, input.as_ptr(), input.len(), &mut out, &mut out_len),
                     PITH_E_REJECTED,

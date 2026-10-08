@@ -10,9 +10,16 @@
 //!
 //! This crate **decompresses only**. A compressor is not needed by any
 //! consumer in the workspace, and a half-tested compressor that claims to
-//! produce valid DEFLATE is worse than none. gzip (RFC 1952) is recognised
-//! by [`inflate_auto`] and refused with [`Error::Unsupported`] rather than
-//! mis-decoded; preset dictionaries are refused for the same reason.
+//! produce valid DEFLATE is worse than none. gzip (RFC 1952) has its own
+//! reader, [`inflate_gzip`]; [`inflate_auto`] - which sniffs raw DEFLATE
+//! and zlib framing only - still refuses a gzip stream with
+//! [`Error::Unsupported`] rather than half-recognising it, and preset
+//! dictionaries are refused for the same reason.
+//!
+//! For streams that arrive a piece at a time, [`StreamingDecoder`] runs
+//! the same DEFLATE core over incremental `feed`/`finish` calls; one-shot
+//! gzip decoding is that state machine driven to completion, so the two
+//! paths cannot disagree.
 //!
 //! Every entry point takes a [`Limits`]. A decompression API without a size
 //! ceiling is a denial-of-service primitive: a few hundred bytes of input
@@ -37,6 +44,9 @@ use core::cmp::Ordering;
 use pith_digest::{Error, Result};
 
 pub mod ffi;
+pub mod stream;
+
+pub use stream::{Framing, StreamingDecoder};
 
 /// Maximum code length in bits; RFC 1951 never exceeds this.
 const MAX_BITS: usize = 15;
@@ -192,31 +202,46 @@ pub fn inflate_auto(input: &[u8], limits: &Limits) -> Result<Vec<u8>> {
     }
 }
 
+/// Decompresses a gzip (RFC 1952) stream: the ten-byte header (plus any
+/// optional FEXTRA/FNAME/FCOMMENT/FHCRC fields), the DEFLATE payload, and
+/// the little-endian CRC-32 + ISIZE trailer - repeated for every member of
+/// a multi-member stream, the outputs concatenated.
+///
+/// The header checks are the RFC's: the `1f 8b` magic and the CM method
+/// byte must be exact (otherwise [`Error::InvalidMagic`]); a reserved FLG
+/// bit set is [`Error::InvalidMagic`]; a header CRC16 (FHCRC) that does
+/// not match is [`Error::BadValue`]; a trailer CRC-32 or ISIZE that does
+/// not match the produced output is [`Error::BadValue`]. A stream that
+/// ends inside any of these structures is [`Error::Truncated`].
+///
+/// Both checksums are computed by `pith-digest` (`crc32`, and `adler32`
+/// through the same unification), so every framing of this crate validates
+/// through the same checksum source. The implementation is deliberately
+/// the [`StreamingDecoder`] run to completion in one `feed`: one-shot and
+/// streaming decode of the same bytes are the same state machine, and a
+/// disagreement between them is unrepresentable.
+pub fn inflate_gzip(input: &[u8], limits: &Limits) -> Result<Vec<u8>> {
+    check_input(input, limits)?;
+    let mut decoder = StreamingDecoder::new(Framing::Gzip, *limits);
+    decoder.feed(input)?;
+    decoder.finish()
+}
+
 /// Adler-32 as specified by RFC 1950 section 9: two modulo-65521 running
 /// sums, returned as `(B << 16) | A` with `A` starting at 1.
 ///
-/// Exposed because the zlib wrapper's trailer check is part of this crate's
-/// correctness argument, and a test that cannot reach the checksum cannot
-/// check it.
+/// Exposed because the zlib wrapper's trailer check is part of this
+/// crate's correctness argument, and a test that cannot reach the checksum
+/// cannot check it. The computation itself lives in `pith-digest`
+/// (checksums are a suite-wide concern, and the gzip reader's CRC-32 is
+/// already routed there); this re-export keeps the crate's public API and
+/// the `pith_inflate_adler32` FFI export stable.
 pub fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65521;
-    // 5552 is the largest run that cannot overflow u32 sums (NMAX, RFC 1950).
-    const NMAX: usize = 5552;
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for chunk in data.chunks(NMAX) {
-        for &byte in chunk {
-            a += u32::from(byte);
-            b += a;
-        }
-        a %= MOD;
-        b %= MOD;
-    }
-    (b << 16) | a
+    pith_digest::adler32(data)
 }
 
 /// Rejects input longer than [`Limits::max_input`] before anything is read.
-fn check_input(input: &[u8], limits: &Limits) -> Result<()> {
+pub(crate) fn check_input(input: &[u8], limits: &Limits) -> Result<()> {
     if input.len() > limits.max_input {
         return Err(Error::too_large("deflate input", limits.max_input));
     }
@@ -225,7 +250,7 @@ fn check_input(input: &[u8], limits: &Limits) -> Result<()> {
 
 /// The two bytes could be a zlib header: method 8, window at most 7, and
 /// check bits that satisfy the modulo-31 test. Used by [`inflate_auto`].
-fn looks_like_zlib(input: &[u8]) -> bool {
+pub(crate) fn looks_like_zlib(input: &[u8]) -> bool {
     input.len() >= 2
         && input[0] & 0x0f == 8
         && input[0] >> 4 <= 7
@@ -235,7 +260,7 @@ fn looks_like_zlib(input: &[u8]) -> bool {
 /// LSB-first bit reader over a byte slice. Every read that runs past the end
 /// of the input is [`Error::Truncated`]; nothing here can panic on short
 /// input.
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     /// Position in bits from the start of `data`.
     bitpos: usize,
@@ -300,7 +325,7 @@ impl<'a> BitReader<'a> {
 /// RFC 1951 3.2.2. Decoding is the classic two-array walk (counts per
 /// length, symbols sorted by length then symbol) - iterative, no recursion,
 /// no table whose size depends on attacker input.
-struct Huffman {
+pub(crate) struct Huffman {
     /// Number of codes of each length 0..=15.
     count: [u16; MAX_BITS + 1],
     /// Symbols sorted by (length, symbol).
@@ -390,7 +415,7 @@ fn build_distance(lengths: &[u8]) -> Result<Huffman> {
 }
 
 /// The fixed Huffman tables of RFC 1951 section 3.2.6.
-fn fixed_tables() -> Result<(Huffman, Huffman)> {
+pub(crate) fn fixed_tables() -> Result<(Huffman, Huffman)> {
     let mut literal_lengths = [0u8; 288];
     for (sym, len) in literal_lengths.iter_mut().enumerate() {
         *len = match sym {
@@ -408,7 +433,7 @@ fn fixed_tables() -> Result<(Huffman, Huffman)> {
 /// Reads the dynamic table description of RFC 1951 section 3.2.7: the
 /// code-length code, then the literal/length and distance code lengths
 /// encoded with it, including the 16/17/18 run-length forms.
-fn dynamic_tables(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman)> {
+pub(crate) fn dynamic_tables(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman)> {
     let nlit = reader.bits(5)? as usize + 257; // 257..=288
     let ndist = reader.bits(5)? as usize + 1; // 1..=32
     let ncl = reader.bits(4)? as usize + 4; // 4..=19
@@ -474,50 +499,95 @@ fn inflate_block(
     distance: &Huffman,
     limits: &Limits,
 ) -> Result<()> {
-    loop {
-        let sym = literal.decode(reader)?;
-        match sym.cmp(&256) {
-            Ordering::Less => {
-                if out.len() >= limits.max_output {
-                    return Err(Error::too_large("inflated output", limits.max_output));
-                }
-                out.push(sym as u8);
+    while !inflate_one_symbol(reader, out, literal, distance, limits)? {}
+    Ok(())
+}
+
+/// Decodes one symbol of a Huffman block body: a literal, a match, or the
+/// end-of-block symbol. Returns whether the block is finished. Every input
+/// read precedes every output effect, so a truncated read leaves the
+/// output untouched and the bit position restorable - the seam the
+/// streaming decoder resumes through.
+pub(crate) fn inflate_one_symbol(
+    reader: &mut BitReader<'_>,
+    out: &mut Vec<u8>,
+    literal: &Huffman,
+    distance: &Huffman,
+    limits: &Limits,
+) -> Result<bool> {
+    let sym = literal.decode(reader)?;
+    match sym.cmp(&256) {
+        Ordering::Less => {
+            if out.len() >= limits.max_output {
+                return Err(Error::too_large("inflated output", limits.max_output));
             }
-            Ordering::Equal => return Ok(()),
-            Ordering::Greater => {
-                let length_index = sym as usize - 257;
-                if length_index >= LENGTH_BASE.len() {
-                    return Err(Error::BadValue("reserved length code"));
-                }
-                let length = LENGTH_BASE[length_index] as usize
-                    + reader.bits(u32::from(LENGTH_EXTRA[length_index]))? as usize;
-                let dsym = distance.decode(reader)? as usize;
-                if dsym >= DIST_BASE.len() {
-                    return Err(Error::BadValue("reserved distance code"));
-                }
-                let dist =
-                    DIST_BASE[dsym] as usize + reader.bits(u32::from(DIST_EXTRA[dsym]))? as usize;
-                // A distance reaching before the start of the output is the
-                // classic out-of-bounds read; it is a checked error, not one.
-                if dist > out.len() {
-                    return Err(Error::BadValue(
-                        "back-reference before the start of the output",
-                    ));
-                }
-                if out.len() + length > limits.max_output {
-                    return Err(Error::too_large("inflated output", limits.max_output));
-                }
-                // A distance smaller than the length is legal and common: the
-                // copy must walk forward one byte at a time so the source it
-                // reads includes bytes the copy itself just wrote.
-                let start = out.len() - dist;
-                for i in 0..length {
-                    let byte = out[start + i];
-                    out.push(byte);
-                }
+            out.push(sym as u8);
+            Ok(false)
+        }
+        Ordering::Equal => Ok(true),
+        Ordering::Greater => {
+            let length_index = sym as usize - 257;
+            if length_index >= LENGTH_BASE.len() {
+                return Err(Error::BadValue("reserved length code"));
             }
+            let length = LENGTH_BASE[length_index] as usize
+                + reader.bits(u32::from(LENGTH_EXTRA[length_index]))? as usize;
+            let dsym = distance.decode(reader)? as usize;
+            if dsym >= DIST_BASE.len() {
+                return Err(Error::BadValue("reserved distance code"));
+            }
+            let dist =
+                DIST_BASE[dsym] as usize + reader.bits(u32::from(DIST_EXTRA[dsym]))? as usize;
+            // A distance reaching before the start of the output is the
+            // classic out-of-bounds read; it is a checked error, not one.
+            if dist > out.len() {
+                return Err(Error::BadValue(
+                    "back-reference before the start of the output",
+                ));
+            }
+            if out.len() + length > limits.max_output {
+                return Err(Error::too_large("inflated output", limits.max_output));
+            }
+            // A distance smaller than the length is legal and common: the
+            // copy must walk forward one byte at a time so the source it
+            // reads includes bytes the copy itself just wrote.
+            let start = out.len() - dist;
+            for i in 0..length {
+                let byte = out[start + i];
+                out.push(byte);
+            }
+            Ok(false)
         }
     }
+}
+
+/// Reads the two header bits of one DEFLATE block: `(bfinal, btype)`.
+pub(crate) fn read_block_header(reader: &mut BitReader<'_>) -> Result<(u32, u32)> {
+    let bfinal = reader.bits(1)?;
+    let btype = reader.bits(2)?;
+    Ok((bfinal, btype))
+}
+
+/// Reads a stored block's LEN/NLEN pair (aligning first) and checks it:
+/// NLEN must be the ones' complement of LEN, and the copy must fit the
+/// output ceiling. Returns LEN.
+pub(crate) fn stored_header(
+    reader: &mut BitReader<'_>,
+    out: &[u8],
+    limits: &Limits,
+) -> Result<usize> {
+    reader.align();
+    let len = reader.bits(16)? as usize;
+    let nlen = reader.bits(16)? as u16;
+    if nlen != !(len as u16) {
+        return Err(Error::BadValue(
+            "stored block NLEN is not the ones' complement of LEN",
+        ));
+    }
+    if out.len() + len > limits.max_output {
+        return Err(Error::too_large("inflated output", limits.max_output));
+    }
+    Ok(len)
 }
 
 /// Decodes a raw DEFLATE stream: the block sequence and nothing after it.
@@ -525,22 +595,11 @@ fn inflate_block(
 fn deflate_stream(input: &[u8], limits: &Limits) -> Result<(Vec<u8>, usize)> {
     let mut reader = BitReader::new(input);
     let mut out = Vec::new();
+    let (mut bfinal, mut btype) = read_block_header(&mut reader)?;
     loop {
-        let bfinal = reader.bits(1)?;
-        let btype = reader.bits(2)?;
         match btype {
             0 => {
-                reader.align();
-                let len = reader.bits(16)? as usize;
-                let nlen = reader.bits(16)? as u16;
-                if nlen != !(len as u16) {
-                    return Err(Error::BadValue(
-                        "stored block NLEN is not the ones' complement of LEN",
-                    ));
-                }
-                if out.len() + len > limits.max_output {
-                    return Err(Error::too_large("inflated output", limits.max_output));
-                }
+                let len = stored_header(&mut reader, &out, limits)?;
                 let bytes = reader.take(len)?;
                 out.extend_from_slice(bytes);
             }
@@ -558,6 +617,7 @@ fn deflate_stream(input: &[u8], limits: &Limits) -> Result<(Vec<u8>, usize)> {
         if bfinal == 1 {
             break;
         }
+        (bfinal, btype) = read_block_header(&mut reader)?;
     }
     Ok((out, reader.consumed_bytes()))
 }

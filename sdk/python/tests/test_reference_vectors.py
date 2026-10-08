@@ -14,11 +14,21 @@ check.
 from __future__ import annotations
 
 import json
+import zlib
 from pathlib import Path
 
 import pytest
 
-from pith_inflate import FfiError, adler32, find_cdylib, inflate_auto, inflate_raw, inflate_zlib
+from pith_inflate import (
+    FfiError,
+    StreamingInflater,
+    adler32,
+    find_cdylib,
+    inflate_auto,
+    inflate_gzip,
+    inflate_raw,
+    inflate_zlib,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -113,3 +123,66 @@ def test_full_output_matches_a_rust_pinned_vector() -> None:
         "65206c617a7920646f672e20"
     )
     assert f"{adler32(out):08x}" == "f724c355"
+
+# --- tier-1 expansion: gzip containers and streaming (schema 2 arrays) ---
+
+
+@pytest.mark.parametrize("vector", REFERENCE["gzip_vectors"], ids=lambda v: v["name"])
+def test_gzip_vector_is_reproduced_hex_exact(vector: dict) -> None:
+    data = bytes.fromhex(vector["input"])
+    out = inflate_gzip(data)
+    assert out == bytes.fromhex(vector["plain"]), vector["name"]
+    # The CRC-32 the Rust decoder validated the trailer with, pinned in
+    # reference.json; cross-checked against Python's own zlib here so a
+    # wrongly generated reference fails loudly on both sides.
+    assert f"{zlib.crc32(out):08x}" == vector["crc32"], vector["name"]
+
+
+@pytest.mark.parametrize("vector", REFERENCE["gzip_bad_vectors"], ids=lambda v: v["name"])
+def test_gzip_bad_vector_is_refused_not_crashing(vector: dict) -> None:
+    with pytest.raises(FfiError) as err:
+        inflate_gzip(bytes.fromhex(vector["input"]))
+    assert err.value.status == -2, vector["name"]
+
+
+@pytest.mark.parametrize("vector", REFERENCE["gzip_vectors"], ids=lambda v: v["name"])
+@pytest.mark.parametrize("size", [1, 7, 64])
+def test_gzip_streaming_feed_matches_one_shot(vector: dict, size: int) -> None:
+    """The chunked-feed equivalence property, through the SDK helper:
+    any chunking decodes to the one-shot output byte-exact."""
+    data = bytes.fromhex(vector["input"])
+    expected = inflate_gzip(data)
+    streamer = StreamingInflater("gzip")
+    for start in range(0, len(data), size):
+        streamer.feed(data[start : start + size])
+        assert expected.startswith(streamer.output()), vector["name"]
+    assert streamer.finish() == expected, vector["name"]
+
+
+def test_streaming_raw_and_zlib_framings_match_one_shot() -> None:
+    for name, framing in (("one_byte", "raw"), ("one_byte/zlib", "zlib")):
+        vector = next(v for v in REFERENCE["vectors"] if v["name"] == name)
+        data = bytes.fromhex(vector["compressed"])
+        streamer = StreamingInflater(framing)
+        for index in range(len(data)):
+            if streamer.feed(data[index : index + 1]):
+                break
+        assert streamer.finish() == bytes.fromhex(vector["plain"]), name
+
+
+def test_streaming_finish_surfaces_the_rejection() -> None:
+    # A truncated gzip member never decodes: feeds stay False and
+    # finish raises the FFI's refusal, never a crash.
+    vector = REFERENCE["gzip_vectors"][0]
+    data = bytes.fromhex(vector["input"])[: len(vector["input"]) // 4]
+    streamer = StreamingInflater("gzip")
+    assert streamer.feed(data) is False
+    assert streamer.output() == b""
+    with pytest.raises(FfiError) as err:
+        streamer.finish()
+    assert err.value.status == -2
+
+
+def test_streaming_rejects_unknown_framing() -> None:
+    with pytest.raises(ValueError):
+        StreamingInflater("bzip2")

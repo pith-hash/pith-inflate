@@ -15,9 +15,10 @@
 //!   the mode the CI gate runs.
 //!
 //! The binary uses `std` (it touches the filesystem) but adds no
-//! dependencies: the JSON emission is hand-rolled, and the digest is the
-//! crate's own public `adler32`, the same checksum the zlib framing
-//! itself is verified with.
+//! dependencies: the JSON emission is hand-rolled, and the digests are
+//! the suite's own checksums through `pith-digest` - Adler-32 pins the
+//! raw/zlib corpus, CRC-32 pins the gzip corpus, the same checksums the
+//! framings themselves validate with.
 
 #[path = "../../tests/vectors.rs"]
 mod vectors;
@@ -25,9 +26,9 @@ mod vectors;
 use std::fs;
 use std::path::Path;
 
-use pith_digest::Error;
-use pith_inflate::{Limits, inflate_raw, inflate_zlib};
-use vectors::{BAD_VECTORS, VECTORS};
+use pith_digest::{Error, crc32};
+use pith_inflate::{Limits, inflate_gzip, inflate_raw, inflate_zlib};
+use vectors::{BAD_VECTORS, GZIP_BAD_VECTORS, GZIP_VECTORS, VECTORS};
 
 /// Where the reference file lives: the repository root, next to the crate
 /// manifest, so the CD workflow can ship it with the SDK artifacts
@@ -133,20 +134,39 @@ fn decode_bad(name: &str, input_hex: &str, zlib_routed: bool) -> &'static str {
     }
 }
 
+/// Decodes one gzip corpus entry and returns its output bytes. A member
+/// the decoder refuses is a broken build, not a reference to write.
+fn decode_gzip_valid(name: &str, input_hex: &str) -> Vec<u8> {
+    let input = unhex(input_hex);
+    inflate_gzip(&input, &Limits::default())
+        .unwrap_or_else(|e| panic!("gzip vector {name} failed to decode: {e}"))
+}
+
+/// Decodes one malformed gzip corpus entry and returns the observed
+/// error variant name, with the same wrong-reason panic contract as
+/// [`decode_bad`].
+fn decode_gzip_bad(name: &str, input_hex: &str) -> &'static str {
+    let input = unhex(input_hex);
+    match inflate_gzip(&input, &Limits::default()) {
+        Err(e) => kind_of(&e),
+        Ok(_) => panic!("gzip bad vector {name} unexpectedly decoded"),
+    }
+}
+
 /// The exact bytes of `reference.json` for the current corpus and decoder:
 /// two-space indent, corpus order, one trailing newline. Nothing here is
 /// sorted or deduplicated on purpose - the file is a transcript of the
 /// corpus, in corpus order, so a diff against a previous commit reads as a
 /// changelog of the corpus.
 fn reference_json() -> String {
-    let mut out = String::with_capacity(64 * 1024);
+    let mut out = String::with_capacity(96 * 1024);
     out.push_str("{\n");
-    out.push_str("  \"schema\": 1,\n");
+    out.push_str("  \"schema\": 2,\n");
     out.push_str("  \"crate\": \"pith-inflate\",\n");
     out.push_str(
-        "  \"description\": \"hex-exact DEFLATE/zlib reference vectors: every \
-tests/vectors.rs corpus entry decoded by pith-inflate, each output pinned by \
-its Adler-32 digest\",\n",
+        "  \"description\": \"hex-exact DEFLATE/zlib/gzip reference vectors: every \
+tests/vectors.rs corpus entry decoded by pith-inflate, raw/zlib outputs pinned by \
+their Adler-32 digest and gzip outputs by their CRC-32\",\n",
     );
     out.push_str("  \"vectors\": [\n");
     for v in VECTORS {
@@ -191,6 +211,47 @@ its Adler-32 digest\",\n",
     }
     let comma = out.rfind("},\n").expect("at least one bad vector entry") + 1;
     out.replace_range(comma..comma + 1, "");
+    out.push_str("  ],\n");
+    out.push_str("  \"gzip_vectors\": [\n");
+    for v in GZIP_VECTORS {
+        let plain = decode_gzip_valid(v.name, v.input);
+        assert_eq!(
+            hex(&plain),
+            v.plain,
+            "gzip vector {} ({}) decoded to bytes that differ from its recorded plaintext",
+            v.name,
+            v.why
+        );
+        out.push_str("    {\n");
+        out.push_str(&format!("      \"name\": \"{}\",\n", json_escape(v.name)));
+        out.push_str(&format!("      \"file\": \"{}\",\n", json_escape(v.file)));
+        out.push_str(&format!("      \"input\": \"{}\",\n", json_escape(v.input)));
+        out.push_str(&format!("      \"plain\": \"{}\",\n", json_escape(v.plain)));
+        out.push_str(&format!("      \"crc32\": \"{:08x}\"\n", crc32(&plain)));
+        out.push_str("    },\n");
+    }
+    let comma = out.rfind("},\n").expect("at least one gzip vector entry") + 1;
+    out.replace_range(comma..comma + 1, "");
+    out.push_str("  ],\n");
+    out.push_str("  \"gzip_bad_vectors\": [\n");
+    for v in GZIP_BAD_VECTORS {
+        let observed = decode_gzip_bad(v.name, v.input);
+        assert_eq!(
+            observed, v.kind,
+            "gzip bad vector {} ({}) failed for the wrong reason",
+            v.name, v.why
+        );
+        out.push_str("    {\n");
+        out.push_str(&format!("      \"name\": \"{}\",\n", json_escape(v.name)));
+        out.push_str(&format!("      \"input\": \"{}\",\n", json_escape(v.input)));
+        out.push_str(&format!("      \"kind\": \"{}\"\n", json_escape(observed)));
+        out.push_str("    },\n");
+    }
+    let comma = out
+        .rfind("},\n")
+        .expect("at least one gzip bad vector entry")
+        + 1;
+    out.replace_range(comma..comma + 1, "");
     out.push_str("  ]\n");
     out.push_str("}\n");
     out
@@ -200,7 +261,7 @@ its Adler-32 digest\",\n",
 fn generate_at(path: &Path) -> std::io::Result<usize> {
     let json = reference_json();
     fs::write(path, json)?;
-    Ok(VECTORS.len() + BAD_VECTORS.len())
+    Ok(entry_count())
 }
 
 /// Recomputes the reference and compares it byte-for-byte with the
@@ -221,7 +282,13 @@ fn verify_at(path: &Path) -> Result<usize, String> {
             first
         ));
     }
-    Ok(VECTORS.len() + BAD_VECTORS.len())
+    Ok(entry_count())
+}
+
+/// Every corpus entry the reference pins: valid and malformed, raw/zlib
+/// and gzip.
+fn entry_count() -> usize {
+    VECTORS.len() + BAD_VECTORS.len() + GZIP_VECTORS.len() + GZIP_BAD_VECTORS.len()
 }
 
 /// The CLI body: the mode argument against the reference path. Returns the
@@ -232,12 +299,14 @@ fn run(path: &Path, mode: Option<&str>) -> i32 {
         Some("gen") => match generate_at(path) {
             Ok(entries) => {
                 println!(
-                    "wrote {} ({} vectors, {} bad vectors)",
+                    "wrote {} ({} vectors, {} bad vectors, {} gzip vectors, {} gzip bad vectors)",
                     path.display(),
                     VECTORS.len(),
-                    BAD_VECTORS.len()
+                    BAD_VECTORS.len(),
+                    GZIP_VECTORS.len(),
+                    GZIP_BAD_VECTORS.len()
                 );
-                debug_assert_eq!(entries, VECTORS.len() + BAD_VECTORS.len());
+                debug_assert_eq!(entries, entry_count());
                 0
             }
             Err(e) => {
@@ -285,15 +354,16 @@ mod tests {
     #[test]
     fn reference_pins_every_corpus_entry() {
         let json = reference_json();
-        assert_eq!(
-            json.matches("\"name\":").count(),
-            VECTORS.len() + BAD_VECTORS.len()
-        );
+        assert_eq!(json.matches("\"name\":").count(), entry_count());
+        assert_eq!(json.matches("\"crc32\":").count(), GZIP_VECTORS.len());
         // The empty vector decodes to nothing, whose Adler-32 is 1.
         assert!(json.contains("\"compressed\": \"0300\""));
         assert!(json.contains("\"adler32\": \"00000001\""));
         // Every declared error kind is carried through verbatim.
         for v in BAD_VECTORS {
+            assert!(json.contains(&format!("\"kind\": \"{}\"", v.kind)));
+        }
+        for v in GZIP_BAD_VECTORS {
             assert!(json.contains(&format!("\"kind\": \"{}\"", v.kind)));
         }
     }
@@ -302,7 +372,7 @@ mod tests {
     fn generate_then_verify_round_trips() {
         let path = scratch("roundtrip.json");
         let entries = generate_at(&path).expect("write reference");
-        assert_eq!(entries, VECTORS.len() + BAD_VECTORS.len());
+        assert_eq!(entries, entry_count());
         assert_eq!(verify_at(&path), Ok(entries));
         let written = fs::read_to_string(&path).expect("read back");
         assert_eq!(written, reference_json());
