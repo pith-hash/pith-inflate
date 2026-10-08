@@ -55,6 +55,7 @@ tools/gen-reference  the vector generator binary (bin name: gen-reference)
 sdk/python         ctypes wheel; build backend reads PITH_CDYLIB_DIR
 sdk/node           koffi-based package; prebuilds/<os-arch>/ carry the cdylib
 sdk/go             cgo binding; go.mod carries the module's cgo flags
+sdk/java           JNI binding (Maven); System.load through the discovery chain
 fuzz/corpus        fuzz inputs, replayed by tests/fuzz_corpus.rs (parser crates)
 reference.json     hex-exact cross-SDK test vectors
 ```
@@ -67,8 +68,9 @@ Rust (the core library):
 cargo add pith-inflate
 ```
 
-Python / Node / Go SDKs are published from the same cdylib on every release;
-see the release assets or the package registries for the matching version.
+Python / Node / Go / Java SDKs are published from the same cdylib on every release;
+see the release assets or the package registries for the matching version
+(the Java artifact ships on Maven Central as `io.github.pith-hash:pith-inflate`).
 
 ## Quick start
 

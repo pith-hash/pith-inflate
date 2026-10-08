@@ -65,3 +65,5 @@ superpower/
 superpowers/
 docs/superpowers/
 
+# Maven build output (sdk/java)
+sdk/java/target/

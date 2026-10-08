@@ -44,6 +44,15 @@ use core::cmp::Ordering;
 use pith_digest::{Error, Result};
 
 pub mod ffi;
+// The Java SDK's native-method surface: `Java_hash_pith_inflate_*`
+// exports that forward to the C ABI above. Compiled out of the unit
+// test build (the `#[no_mangle]` exports would collide with the test
+// binary's copies); `tests/java_ffi.rs` covers the glue against a
+// synthetic JNI environment instead. Private module: the JVM links
+// the exports by symbol name, so nothing here needs to be publicly
+// nameable in Rust.
+#[cfg(not(test))]
+mod ffi_jni;
 pub mod stream;
 
 pub use stream::{Framing, StreamingDecoder};
