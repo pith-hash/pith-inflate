@@ -286,6 +286,46 @@ jobs:
         with:
           packages-dir: wheelhouse-flat
 
+  # ==================== Publish Java SDK ====================
+  publish-maven:
+    name: Publish Java SDK to Maven Central
+    needs: [readme-sync, release, build]
+    if: |
+      !cancelled() && needs.build.result == 'success' &&
+      needs.readme-sync.result == 'success' &&
+      vars.PUBLISH_MAVEN == 'true'
+    runs-on: ubuntu-latest
+    environment: maven
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up JDK 21
+        uses: actions/setup-java@ae7ea197ecd226ac67f9f42b9a9e616c12a1b54a # v6.0.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          server-id: central
+          server-username: CENTRAL_USERNAME
+          server-password: CENTRAL_PASSWORD
+          gpg-passphrase: GPG_PASSPHRASE
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.CENTRAL_GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+      - name: Publish to Maven Central
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          GPG_PASSPHRASE: ${{ secrets.CENTRAL_GPG_PASSPHRASE }}
+        run: mvn -B -Prelease -DskipTests deploy -f sdk/java/pom.xml
   # ==================== Publish Node SDK ====================
   publish-npm:
     name: Publish Node SDK to npm
