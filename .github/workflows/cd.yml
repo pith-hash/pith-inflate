@@ -209,6 +209,7 @@ jobs:
             sdk/python/dist/
             reference.json
       - name: Attach build output to the release
+        continue-on-error: true  # asset delete 404 race must not gate publishing
         if: vars.PUBLISH_RELEASE_ASSET == 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
