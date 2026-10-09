@@ -325,10 +325,6 @@ jobs:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
           GPG_PASSPHRASE: ${{ secrets.CENTRAL_GPG_PASSPHRASE }}
-        env:
-          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
-          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
-          GPG_PASSPHRASE: ${{ secrets.CENTRAL_GPG_PASSPHRASE }}
         run: |
           mvn -B -Prelease -DskipTests -DcentralBaseUrl=http://127.0.0.1:9 deploy -f sdk/java/pom.xml || true
           BUNDLE=sdk/java/target/central-publishing/central-bundle.zip
