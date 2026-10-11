@@ -1,0 +1,9 @@
+# Text files are stored and checked out with LF on every platform. This is
+# not a style preference: reference.json is a byte contract that
+# `gen-reference verify` compares byte-for-byte, and the Rust sources and
+# fixtures are embedded or hashed from the working tree, so a CRLF checkout
+# (Windows autocrlf) would silently change what is verified.
+* text=auto eol=lf
+
+# Binary fixtures whose bytes are part of the test contract.
+*.gz binary
