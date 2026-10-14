@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pith-inflate"
-version = "0.1.1-beta.1"
+version = "0.1.1"
 description = "DEFLATE and zlib decompression SDK: RFC 1951/1950 streams with hard size limits via the pith-inflate Rust cdylib (ctypes, zero-dep)"
 license = "MIT"
 requires-python = ">=3.9"
