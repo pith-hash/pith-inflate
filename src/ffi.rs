@@ -30,14 +30,12 @@
 //! must come back `-2` everywhere, not `-1` on one language.
 //!
 //! Each export below is a single-line-signature delegation (via
-//! `#[rustfmt::skip]`) to a private, normally-mangled core function.
-//! That packing is load-bearing for the coverage gate: `#[no_mangle]`
-//! symbols collide by name across the workspace's test binaries in the
-//! llvm-cov profile merge, so an export's executable lines read as
-//! uncovered whenever *any* other test target links the crate; private
-//! mangled functions merge per-binary and stay covered. Keeping every
-//! export at two executable lines bounds that merge artifact to ten
-//! lines, and the logic lives in fully-tested private cores.
+//! `#[rustfmt::skip]`) to a private, normally-mangled core function, and
+//! the logic lives in those fully-tested cores. The exports are
+//! `no_mangle` outside `cfg(test)` only: a `no_mangle` symbol built into
+//! both the unit-test binary and the shipped library gets two coverage
+//! hashes, and `llvm-cov` keeps whichever copy it reads first, so the
+//! coverage gate would depend on the order of the test objects.
 
 #![allow(unsafe_code)]
 
@@ -88,7 +86,7 @@ enum Op {
 /// `usize`. All must stay valid for the duration of the call; the
 /// function retains nothing.
 #[rustfmt::skip]
-#[unsafe(no_mangle)] pub unsafe extern "C" fn pith_inflate_inflate_raw(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Raw, data, len, out, out_len) }
+#[cfg_attr(not(test), unsafe(no_mangle))] pub unsafe extern "C" fn pith_inflate_inflate_raw(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Raw, data, len, out, out_len) }
 
 /// Decompresses a zlib (RFC 1950) stream: two-byte header, DEFLATE
 /// payload, big-endian Adler-32 trailer.
@@ -101,7 +99,7 @@ enum Op {
 ///
 /// Same contract as [`pith_inflate_inflate_raw`].
 #[rustfmt::skip]
-#[unsafe(no_mangle)] pub unsafe extern "C" fn pith_inflate_inflate_zlib(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Zlib, data, len, out, out_len) }
+#[cfg_attr(not(test), unsafe(no_mangle))] pub unsafe extern "C" fn pith_inflate_inflate_zlib(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Zlib, data, len, out, out_len) }
 
 /// Decompresses either framing, sniffing the two-byte zlib header.
 ///
@@ -113,7 +111,7 @@ enum Op {
 ///
 /// Same contract as [`pith_inflate_inflate_raw`].
 #[rustfmt::skip]
-#[unsafe(no_mangle)] pub unsafe extern "C" fn pith_inflate_inflate_auto(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Auto, data, len, out, out_len) }
+#[cfg_attr(not(test), unsafe(no_mangle))] pub unsafe extern "C" fn pith_inflate_inflate_auto(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Auto, data, len, out, out_len) }
 
 /// Decompresses a gzip (RFC 1952) stream: header, optional FEXTRA /
 /// FNAME / FCOMMENT / FHCRC fields, DEFLATE payload, CRC-32 + ISIZE
@@ -128,7 +126,7 @@ enum Op {
 ///
 /// Same contract as [`pith_inflate_inflate_raw`].
 #[rustfmt::skip]
-#[unsafe(no_mangle)] pub unsafe extern "C" fn pith_inflate_inflate_gzip(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Gzip, data, len, out, out_len) }
+#[cfg_attr(not(test), unsafe(no_mangle))] pub unsafe extern "C" fn pith_inflate_inflate_gzip(data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32 { inflate_ffi(Op::Gzip, data, len, out, out_len) }
 
 /// Computes the Adler-32 checksum (RFC 1950 section 9) of `len` bytes
 /// at `data` into the caller-provided `out` slot.
@@ -144,7 +142,7 @@ enum Op {
 /// is zero); `out` to one writable `u32`, valid for the duration of
 /// the call.
 #[rustfmt::skip]
-#[unsafe(no_mangle)] pub unsafe extern "C" fn pith_inflate_adler32(data: *const u8, len: usize, out: *mut u32) -> i32 { adler32_ffi(data, len, out) }
+#[cfg_attr(not(test), unsafe(no_mangle))] pub unsafe extern "C" fn pith_inflate_adler32(data: *const u8, len: usize, out: *mut u32) -> i32 { adler32_ffi(data, len, out) }
 
 /// Releases a buffer handed out by [`pith_inflate_inflate_raw`],
 /// [`pith_inflate_inflate_zlib`] or [`pith_inflate_inflate_auto`].
@@ -158,7 +156,7 @@ enum Op {
 /// zero-length buffer is freed by passing its (dangling) pointer with
 /// `len == 0`.
 #[rustfmt::skip]
-#[unsafe(no_mangle)] pub unsafe extern "C" fn pith_inflate_free(ptr: *mut u8, len: usize) { free_buffer(ptr, len) }
+#[cfg_attr(not(test), unsafe(no_mangle))] pub unsafe extern "C" fn pith_inflate_free(ptr: *mut u8, len: usize) { free_buffer(ptr, len) }
 
 /// The safe core of [`pith_inflate_adler32`]: null-guard the caller's
 /// slot, borrow the input, checksum. No allocation, no free. The
